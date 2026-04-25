@@ -1,0 +1,432 @@
+from __future__ import annotations
+
+import os
+import re
+from pathlib import PurePosixPath
+
+from fastmcp import FastMCP
+
+from .config import SSHConfig
+from .ssh_client import PersistentSSH
+
+mcp = FastMCP("remote-ssh-server")
+ssh = PersistentSSH(SSHConfig.from_env())
+ssh.connect()
+
+MAX_TARGET_CHARS = 120_000
+MAX_STRUCTURE_CHARS = 35_000
+MAX_RELATED_CHARS = 180_000
+
+
+KEYWORDS = {"if", "for", "while", "switch", "return", "sizeof"}
+
+
+def _bash_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _run_script(script: str, timeout: int = 120) -> dict:
+    return ssh.run_script(script=script, timeout=timeout)
+
+
+def _run_stdout(script: str, timeout: int = 120) -> str:
+    result = _run_script(script, timeout)
+    return result.get("stdout", "")
+
+
+def _trim_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n... (truncated)"
+
+
+def _md_code_block(text: str, lang: str = "text", max_chars: int = 20_000) -> str:
+    return f"```{lang}\n{_trim_text(text, max_chars)}\n```"
+
+
+def _detect_target_type(target: str) -> str:
+    raw = target.strip()
+    lower = raw.lower()
+    if lower in {"current diff", "diff", "git diff"}:
+        return "diff"
+    if lower in {"staged diff", "cached diff", "git diff --cached"}:
+        return "staged_diff"
+    if lower.startswith("commit "):
+        return "commit"
+    if lower.startswith("patch "):
+        return "patch"
+    if raw.startswith("/") or "/" in raw or raw.endswith((".c", ".h", ".cc", ".cpp", ".hpp", ".py", ".rs")):
+        return "file"
+    return "function"
+
+
+def _extract_changed_files(diff_text: str) -> list[str]:
+    files: list[str] = []
+    for line in diff_text.splitlines():
+        if line.startswith("+++ b/"):
+            files.append(line.removeprefix("+++ b/"))
+        elif line.startswith("diff --git a/"):
+            right = line.split(" b/", maxsplit=1)
+            if len(right) == 2:
+                files.append(right[1])
+    return sorted({f for f in files if f and f != "/dev/null"})
+
+
+def _extract_symbols(text: str) -> dict[str, list[str]]:
+    functions = {
+        name
+        for name in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text)
+        if name not in KEYWORDS and not name.startswith("_")
+    }
+    structs = set(re.findall(r"\bstruct\s+([A-Za-z_][A-Za-z0-9_]*)", text))
+    macros = set(re.findall(r"\b([A-Z][A-Z0-9_]{2,})\b", text))
+    globals_ = set(re.findall(r"\b(g_[A-Za-z0-9_]+)\b", text))
+    return {
+        "functions": sorted(functions)[:300],
+        "structs": sorted(structs)[:300],
+        "macros": sorted(macros)[:300],
+        "globals": sorted(globals_)[:300],
+    }
+
+
+def _collect_target_source(repo_path: str, target: str, target_type: str) -> str:
+    if target_type == "diff":
+        script = f"set -e\ncd {_bash_quote(repo_path)}\ngit diff --stat\ngit diff --unified=80"
+    elif target_type == "staged_diff":
+        script = f"set -e\ncd {_bash_quote(repo_path)}\ngit diff --cached --stat\ngit diff --cached --unified=80"
+    elif target_type == "commit":
+        commit_id = target.split(maxsplit=1)[1].strip()
+        script = f"set -e\ncd {_bash_quote(repo_path)}\ngit show --stat {commit_id}\ngit show --unified=80 {commit_id}"
+    elif target_type == "patch":
+        patch_path = target.split(maxsplit=1)[1].strip()
+        script = f"set -e\ncd {_bash_quote(repo_path)}\ncat {_bash_quote(patch_path)}"
+    elif target_type == "file":
+        script = (
+            f"set -e\ncd {_bash_quote(repo_path)}\n"
+            f"echo 'Target file: {target}'\n"
+            f"sed -n '1,320p' {_bash_quote(target)}"
+        )
+    else:
+        escaped = re.escape(target)
+        script = (
+            f"set -e\ncd {_bash_quote(repo_path)}\n"
+            f"rg -n --hidden -g '*.c' -g '*.h' {_bash_quote(target)} . | head -200\n"
+            f"echo '\n---- likely definitions ----'\n"
+            f"rg -n --hidden -g '*.c' -g '*.h' {_bash_quote('^.*' + escaped + r'\\s*\\(')} . | head -80"
+        )
+    return _run_stdout(script, timeout=220)
+
+
+def _render_review_target(target: str, source_text: str, changed_files: list[str], symbols: dict[str, list[str]]) -> str:
+    return _trim_text(
+        "# Review Target\n\n"
+        "## Target Description\n\n"
+        f"{target}\n\n"
+        "## Changed Files\n\n"
+        + ("\n".join(f"- {f}" for f in changed_files) if changed_files else "- (none detected)")
+        + "\n\n## Changed Hunks / Functions\n\n"
+        + _md_code_block(source_text, "diff", max_chars=80_000)
+        + "\n\n## Modified Symbols\n\n"
+        + ("\n".join(f"- {x}()" for x in symbols["functions"][:200]) or "- (none)")
+        + "\n"
+        + ("\n".join(f"- struct {x}" for x in symbols["structs"][:80]) or "")
+        + "\n"
+        + ("\n".join(f"- {x}" for x in symbols["macros"][:80]) or "")
+        + "\n"
+        + ("\n".join(f"- {x}" for x in symbols["globals"][:80]) or "")
+        + "\n\n## Notes\n\n"
+        "This file is generated by review_prepare.\n"
+        "The goal is to keep only the directly reviewable target.\n",
+        MAX_TARGET_CHARS,
+    )
+
+
+def _collect_repo_structure(repo_path: str, changed_files: list[str]) -> str:
+    top = _run_stdout(
+        f"""
+set -e
+cd {_bash_quote(repo_path)}
+find . -maxdepth 2 -type d \\
+  -not -path '*/.git/*' \\
+  -not -path '*/build/*' \\
+  -not -path '*/out/*' \\
+  -not -path '*/.cache/*' | sort
+""",
+        timeout=180,
+    )
+
+    dir_sections: list[str] = []
+    changed_dirs = sorted({str(PurePosixPath(path).parent) for path in changed_files if path})[:30]
+    for directory in changed_dirs:
+        nearby = _run_stdout(
+            f"""
+set -e
+cd {_bash_quote(repo_path)}
+if [ -d {_bash_quote(directory)} ]; then
+  find {_bash_quote(directory)} -maxdepth 2 -type f | sort | head -300
+fi
+""",
+            timeout=120,
+        )
+        dir_sections.append(f"### {directory}\n\n{_md_code_block(nearby)}")
+
+    builds_all = _run_stdout(
+        f"""
+set -e
+cd {_bash_quote(repo_path)}
+find . \\( -name 'Makefile' -o -name 'Kbuild' -o -name 'CMakeLists.txt' -o -name '*.mk' \\) | sort
+""",
+        timeout=120,
+    )
+    filtered_builds = []
+    for line in builds_all.splitlines():
+        for d in changed_dirs:
+            if d == "." or line.startswith(f"./{d}/") or line == f"./{d}/Makefile":
+                filtered_builds.append(line)
+                break
+
+    return _trim_text(
+        "# Repository Structure\n\n"
+        f"## Repo Path\n\n{repo_path}\n\n"
+        "## Top-level Directories\n\n"
+        f"{_md_code_block(top)}\n\n"
+        "## Directories Containing Modified Files\n\n"
+        + ("\n\n".join(dir_sections) if dir_sections else "(none)\n")
+        + "\n\n## Related Build Files\n\n"
+        + _md_code_block("\n".join(filtered_builds) if filtered_builds else "(none)")
+        + "\n\n## Notes\n\nThis structure is intentionally compressed because the repository is large.\n",
+        MAX_STRUCTURE_CHARS,
+    )
+
+
+def _extract_call_like_tokens(text: str) -> list[str]:
+    tokens = []
+    for token in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
+        if token not in KEYWORDS:
+            tokens.append(token)
+    return sorted(set(tokens))
+
+
+def _collect_function_slice(repo_path: str, fn: str) -> tuple[str, str]:
+    refs = _run_stdout(
+        f"set -e\ncd {_bash_quote(repo_path)}\nrg -n --hidden -g '*.c' -g '*.h' {_bash_quote(r'\\b'+fn+r'\\s*\\(')} . | head -200",
+        timeout=120,
+    )
+    first = refs.splitlines()[0] if refs.strip() else ""
+    if not first or ":" not in first:
+        return refs, ""
+    path, line, *_ = first.split(":", maxsplit=2)
+    try:
+        line_no = int(line)
+    except ValueError:
+        return refs, ""
+
+    start = max(1, line_no - 30)
+    end = line_no + 120
+    snippet = _run_stdout(
+        f"set -e\ncd {_bash_quote(repo_path)}\nsed -n '{start},{end}p' {_bash_quote(path)}",
+        timeout=120,
+    )
+    return refs, snippet
+
+
+def _collect_related_context(repo_path: str, changed_files: list[str], symbols: dict[str, list[str]]) -> str:
+    lines: list[str] = [
+        "# Review Related Context\n\n",
+        "## Target Files\n\n",
+        *(f"- {p}\n" for p in changed_files),
+        "\n## Target Symbols\n\n",
+        *(f"- {fn}()\n" for fn in symbols.get("functions", [])[:40]),
+        *(f"- struct {s}\n" for s in symbols.get("structs", [])[:30]),
+        *(f"- {m}\n" for m in symbols.get("macros", [])[:30]),
+        *(f"- {g}\n" for g in symbols.get("globals", [])[:30]),
+    ]
+
+    for fn in symbols.get("functions", [])[:15]:
+        refs, snippet = _collect_function_slice(repo_path, fn)
+        callees = _extract_call_like_tokens(snippet)[:30]
+
+        caller_refs = _run_stdout(
+            f"set -e\ncd {_bash_quote(repo_path)}\nrg -n --hidden -g '*.c' -g '*.h' {_bash_quote(r'\\b'+fn+r'\\s*\\(')} . | head -200",
+            timeout=120,
+        )
+
+        lines.append(f"\n---\n\n## Function: {fn}()\n\n")
+        lines.append("### Definition\n\n")
+        lines.append(_md_code_block(refs, max_chars=15_000))
+        lines.append("\n\n### Summary\n\n")
+        lines.append(f"{fn}() summary is generated from local references and nearby code snippets.\n")
+        lines.append("\n### Callees\n\n")
+        if callees:
+            lines.append("| Function | File | Reason |\n|---|---|---|\n")
+            for callee in callees:
+                lines.append(f"| {callee}() | unknown | inferred from function body call pattern |\n")
+        else:
+            lines.append("- (none inferred)\n")
+
+        lines.append("\n### Callers\n\n")
+        lines.append(_md_code_block(caller_refs, max_chars=12_000))
+
+    include_sections: list[str] = []
+    for file_path in changed_files[:20]:
+        includes = _run_stdout(
+            f"""
+set -e
+cd {_bash_quote(repo_path)}
+if [ -f {_bash_quote(file_path)} ]; then
+  rg -n '^#include\\s+["<].+[">]' {_bash_quote(file_path)} | head -200
+fi
+""",
+            timeout=120,
+        )
+        filtered = "\n".join(
+            line
+            for line in includes.splitlines()
+            if "<linux/" not in line
+            and "<uapi/linux/" not in line
+            and "<stdio" not in line
+            and "<stdint" not in line
+        )
+        include_sections.append(f"### {file_path}\n\n{_md_code_block(filtered)}")
+
+    lines.append("\n---\n\n## Related Includes (project/local focused)\n\n")
+    lines.append("\n\n".join(include_sections) if include_sections else "(none)\n")
+
+    lines.append(
+        "\n\n## Risk Notes\n\n"
+        "- Check lock pairing (`mutex/spinlock/rwlock/atomic/refcount`) and failure-path unlock coverage.\n"
+        "- Check allocation/free, copy_to_user/copy_from_user return handling, and unregister/cancel lifecycle.\n"
+        "- Check init/exit/probe/remove/open/release lifecycle and callback relationships.\n"
+    )
+
+    return _trim_text("".join(lines), MAX_RELATED_CHARS)
+
+
+def _review_prompt() -> str:
+    return (
+        "# Code Review Prompt\n\n"
+        "You are reviewing a C/Linux kernel style code change.\n\n"
+        "## Inputs\n\n"
+        "Read the following files:\n\n"
+        "1. `.review/review_target.md`\n"
+        "2. `.review/structure.md`\n"
+        "3. `.review/review_related.md`\n"
+        "4. `.review/review_tips.md`\n\n"
+        "## Review Requirements\n\n"
+        "Focus on correctness, concurrency, memory lifetime, error paths, API contracts, and compatibility with the surrounding module.\n\n"
+        "## Output Format\n\n"
+        "### 1. Summary\n"
+        "### 2. Must-fix Issues\n"
+        "### 3. Potential Risks\n"
+        "### 4. Questions for Author\n"
+        "### 5. No Issue Found\n\n"
+        "After review, save the final result to `.review/review_result.md`.\n"
+    )
+
+
+def _write_review_files(repo_path: str, target: str, review_tips: str, target_type: str) -> dict:
+    review_dir = PurePosixPath(repo_path) / ".review"
+    _run_stdout(f"set -e\ncd {_bash_quote(repo_path)}\nmkdir -p .review", timeout=60)
+
+    source_text = _collect_target_source(repo_path, target, target_type)
+    changed_files = _extract_changed_files(source_text)
+    if target_type == "file" and target not in changed_files:
+        changed_files = sorted(set(changed_files + [target]))
+    symbols = _extract_symbols(source_text)
+
+    review_target = _render_review_target(target, source_text, changed_files, symbols)
+    structure_md = _collect_repo_structure(repo_path, changed_files)
+    related_md = _collect_related_context(repo_path, changed_files, symbols)
+    tips_md = f"# Review Tips from User\n\n{review_tips or '(none)'}\n"
+    prompt_md = _review_prompt()
+
+    encoded = {
+        "review_target.md": review_target,
+        "structure.md": structure_md,
+        "review_related.md": related_md,
+        "review_tips.md": tips_md,
+        "review_prompt.md": prompt_md,
+    }
+
+    for name, body in encoded.items():
+        _run_stdout(
+            f"set -e\ncd {_bash_quote(repo_path)}\ncat > .review/{name} << 'EOF'\n{body}\nEOF",
+            timeout=120,
+        )
+
+    return {
+        "ok": True,
+        "status": "ok",
+        "repo_path": repo_path,
+        "target": target,
+        "target_type": target_type,
+        "files": [
+            str(review_dir / "review_target.md"),
+            str(review_dir / "structure.md"),
+            str(review_dir / "review_related.md"),
+            str(review_dir / "review_tips.md"),
+            str(review_dir / "review_prompt.md"),
+        ],
+        "summary": {
+            "changed_files": changed_files[:100],
+            "functions": symbols.get("functions", [])[:40],
+            "structs": symbols.get("structs", [])[:30],
+            "macros": symbols.get("macros", [])[:30],
+            "globals": symbols.get("globals", [])[:30],
+        },
+        "workflow": [
+            "1) identify review target",
+            "2) collect repository structure",
+            "3) collect related implementation and call references",
+            "4) save review tips and review prompt",
+            "5) let agent review and save .review/review_result.md",
+        ],
+    }
+
+
+@mcp.tool
+def ssh_exec(cmd: str, timeout: int = 30) -> dict:
+    """Execute one short remote command with a persistent SSH connection."""
+    return ssh.run_command(cmd=cmd, timeout=timeout)
+
+
+@mcp.tool
+def ssh_exec_script(script: str, timeout: int = 300) -> dict:
+    """Execute a multi-line script once in one remote shell (bash -lc)."""
+    return ssh.run_script(script=script, timeout=timeout)
+
+
+@mcp.tool
+def review_prepare(repo_path: str, target: str, review_tips: str = "") -> dict:
+    """Prepare workflow-constrained review context into <repo_path>/.review/*.md."""
+    target_type = _detect_target_type(target)
+    return _write_review_files(repo_path=repo_path, target=target, review_tips=review_tips, target_type=target_type)
+
+
+@mcp.tool
+def prepare_review_context(repo_path: str, target: str, review_tips: str = "") -> dict:
+    """Backward-compatible alias of review_prepare."""
+    return review_prepare(repo_path=repo_path, target=target, review_tips=review_tips)
+
+
+@mcp.tool
+def review_write_result(repo_path: str, review_result: str) -> dict:
+    """Write final review result into <repo_path>/.review/review_result.md."""
+    _run_stdout(f"set -e\ncd {_bash_quote(repo_path)}\nmkdir -p .review", timeout=60)
+    _run_stdout(
+        f"set -e\ncd {_bash_quote(repo_path)}\ncat > .review/review_result.md << 'EOF'\n{review_result}\nEOF",
+        timeout=60,
+    )
+    return {
+        "ok": True,
+        "status": "ok",
+        "review_result_file": f"{repo_path}/.review/review_result.md",
+        "message": "review_result.md saved",
+    }
+
+
+if __name__ == "__main__":
+    host = os.getenv("MCP_HOST", "127.0.0.1")
+    port = int(os.getenv("MCP_PORT", "8000"))
+    transport = "stdio" if os.getenv("MCP_STDIO", "1") == "1" else "http"
+    mcp.run(transport=transport, host=host, port=port)
