@@ -1,0 +1,233 @@
+#### tools1: ssh_exec
+```
+流程
+1. Agent 调用 MCP tool `ssh_exec(cmd, timeout)`。
+2. 服务端进入 `PersistentSSH.run_command`，先做 denylist 校验（如 sudo/rm -rf 等）。
+3. 若命中 denylist，直接返回 `status=denied`，并写审计日志。
+4. 若未命中，检查/重建 SSH 连接（复用全局 transport）。
+5. 打开新的 SSH channel 执行单条命令。
+6. 轮询读取 stdout/stderr，直到：
+   - 命令结束：返回 `ok/failed + returncode + stdout/stderr`。
+   - 超时：返回 `status=timeout`，附带 partial 输出与 next_actions。
+7. 无论成功/失败/超时，都写入 `mcp_ssh_audit.log`。
+8. channel 关闭，但 SSH 长连接保留给后续调用复用。
+```
+
+input: 举例说明
+- `cmd`: `"uname -a"`
+- `timeout`: `30`
+
+output：举例说明
+- 成功：`{"ok": true, "status": "ok", "returncode": 0, "stdout": "Linux ...", "stderr": ""}`
+- 超时：`{"ok": false, "status": "timeout", "stdout_partial": "...", "next_actions": ["retry_with_longer_timeout", ...]}`
+
+与agent的交互流程：举例说明
+1. Agent: “请执行 `uname -a`”。
+2. Tool 返回内核信息。
+3. Agent 基于结果继续推理（如判断目标机器架构）。
+4. 若返回 timeout，Agent 用 `next_actions` 引导用户选择“重试/补充信息/停止”。
+
+loop设计（如果有）
+- 内部有读取输出的轮询 loop（20ms 间隔）。
+- Agent 层可做外部重试 loop：超时后按用户选择增大 timeout 再次调用。
+
+
+#### tools2: ssh_exec_script
+```
+流程
+1. Agent 调用 `ssh_exec_script(script, timeout)`。
+2. 服务端在 `run_script` 先做 denylist 校验（脚本整体文本）。
+3. 通过 `bash -lc '<script>'` 包装后在同一 channel 一次性执行。
+4. 执行期持续拉取 stdout/stderr。
+5. 结束时返回结构化结果；超时时返回 partial 输出与建议动作。
+6. 写审计日志（记录 script_summary 而非整段脚本）。
+7. 关闭 channel，保留 SSH 长连接。
+```
+
+input: 举例说明
+- `script`:
+  ```bash
+  set -e
+  cd /tmp
+  pwd
+  ls -la
+  ```
+- `timeout`: `120`
+
+output：举例说明
+- `{"ok": true, "status": "ok", "stdout": "/tmp\n...", "returncode": 0}`
+- 或 `{"ok": false, "status": "denied", "stderr": "Script blocked by safety denylist."}`
+
+与agent的交互流程：举例说明
+1. Agent 需要原子执行多行命令（如切目录+构建）。
+2. 一次调用返回完整 stdout/stderr。
+3. Agent 将 stderr 提炼为诊断建议（如缺依赖、编译失败点）。
+
+loop设计（如果有）
+- 同 `ssh_exec`，内部 channel 读取是轮询 loop。
+- 典型不需要多轮 tool loop；失败时由 Agent 发起下一次脚本调用。
+
+
+#### tools3: review_prepare
+```
+流程
+1. Agent 调用 `review_prepare(repo_path, target, review_tips)`。
+2. 系统识别 target 类型：function/file/diff/staged_diff/commit/patch。
+3. 根据 target 类型收集“目标源码”:
+   - diff: `git diff`
+   - staged diff: `git diff --cached`
+   - commit: `git show`
+   - patch: `cat patch`
+   - file: `sed` 抽取文件片段
+   - function: `rg` 搜索定义与引用
+4. 从目标文本提取 changed_files 和 symbols（函数/结构体/宏/全局变量）。
+5. 生成 `review_target.md`（目标、改动、符号摘要）。
+6. 生成 `structure.md`（目录结构、改动目录附近文件、相关构建文件）。
+7. 生成 `review_related.md`（函数切片、可能调用关系、include、风险检查清单）。
+8. 写 `review_tips.md`（用户附加关注点）。
+9. 写 `review_prompt.md`（统一审查模板与输出格式）。
+10. 返回 files 列表与 summary，提示后续让 Agent 审查并写结果。
+```
+
+input: 举例说明
+- `repo_path`: `"/home/dev/linux"`
+- `target`: `"current diff"`（也可 `"commit abc123"`、`"drivers/net/foo.c"`、`"my_func"`）
+- `review_tips`: `"重点看并发与错误路径资源释放"`
+
+output：举例说明
+- `{"ok": true, "target_type": "diff", "files": [".../.review/review_target.md", ...], "summary": {"changed_files": [...], "functions": [...]}, "workflow": [...], "subagent_recommendations": {"orchestrator_pattern": [...], "subagents": [...], "loop_hints": [...]}}`
+
+与agent的交互流程：举例说明
+1. Agent 先调用本工具准备上下文。
+2. Agent 读取 `.review/*.md`，按 `review_prompt.md` 执行审查。
+3. Agent 形成最终结论后调用 `review_write_result` 落盘。
+
+loop设计（如果有）
+- 工具内部有“按函数遍历”的 loop：对 symbols 中前若干函数逐个抽取定义、caller/callee。
+- Agent 层常见 loop：
+  - 第1轮 `review_prepare(target=current diff)`
+  - 若范围过大，第2轮改为 `target=具体文件/函数` 精细化重跑。
+
+
+#### tools4: prepare_review_context（兼容别名）
+```
+流程
+1. Agent 调用 `prepare_review_context(...)`。
+2. 服务端直接转发到 `review_prepare(...)`。
+3. 返回内容与 `review_prepare` 完全一致。
+```
+
+input: 举例说明
+- 与 `review_prepare` 相同。
+
+output：举例说明
+- 与 `review_prepare` 相同。
+
+与agent的交互流程：举例说明
+- 旧版 Agent 仍可调用该名字，不需要改 prompt；新服务端保持兼容。
+
+loop设计（如果有）
+- 无额外 loop；复用 `review_prepare` 的全部 loop 行为。
+
+
+#### tools5: review_write_result
+```
+流程
+1. Agent 在完成审查后调用 `review_write_result(repo_path, review_result)`。
+2. 服务端确保 `<repo_path>/.review` 存在。
+3. 将 markdown 文本写入 `.review/review_result.md`。
+4. 返回保存成功状态与文件路径。
+```
+
+input: 举例说明
+- `repo_path`: `"/home/dev/linux"`
+- `review_result`: `"# Summary\n...\n# Must-fix Issues\n..."`
+
+output：举例说明
+- `{"ok": true, "status": "ok", "review_result_file": "/home/dev/linux/.review/review_result.md", "message": "review_result.md saved"}`
+
+与agent的交互流程：举例说明
+1. Agent 给出最终审查文本。
+2. 工具落盘。
+3. Agent 再向用户汇报“审查已写入指定文件”。
+
+loop设计（如果有）
+- 无。
+
+
+#### 全局协同流程（tools 编排总览）
+```
+典型主线A（远程执行类）
+Agent -> ssh_exec / ssh_exec_script -> 解析结果 -> 继续下一步命令或结束
+
+典型主线B（代码审查类）
+Agent -> review_prepare(或prepare_review_context)
+      -> 读取 .review/review_target.md / structure.md / review_related.md / review_tips.md / review_prompt.md
+      -> 生成审查结论
+      -> review_write_result
+      -> 向用户确认落盘路径
+```
+
+input: 举例说明
+- 主线A输入是命令/脚本。
+- 主线B输入是 repo_path + target + review_tips。
+
+output：举例说明
+- 主线A输出是命令执行结果 JSON。
+- 主线B输出是审查上下文文件 + 最终 `review_result.md`。
+
+与agent的交互流程：举例说明
+- Agent 负责“决策与解释”；tools 负责“执行与结构化结果”。
+- 当出现 timeout/denied/error，Agent 根据返回字段（status、next_actions、stderr）进行下一轮策略决策。
+
+loop设计（如果有）
+- 命令执行 loop：超时重试（可调大 timeout）。
+- 审查 loop：先粗粒度（diff），再细粒度（文件/函数）迭代收敛。
+
+
+#### workflow中 Agent 使用 Subagent 建议
+```
+建议策略
+1. 信息收集型 Subagent
+   - 负责调用 `ssh_exec` / `ssh_exec_script` 拉取环境、日志、构建输出。
+   - 主 Agent 只接收结构化摘要（关键 stdout/stderr、returncode、timeout 状态）。
+2. 代码定位型 Subagent
+   - 在 `review_prepare` 之后，专门读取 `.review/review_target.md` 与 `.review/review_related.md`，输出“高风险函数/文件清单”。
+3. 审查结论型 Subagent
+   - 基于 `review_prompt.md` 生成初稿：Summary / Must-fix / Risks / Questions。
+   - 主 Agent 统一合并多 Subagent 结论并去重，再调用 `review_write_result` 落盘。
+4. 超时与重试 Subagent（可选）
+   - 专门处理 timeout 场景，按指数或阶梯策略调整 timeout（如 30 -> 60 -> 120）。
+
+推荐编排
+- 主 Agent（Orchestrator）
+  -> Subagent A（远程执行/采集）
+  -> Subagent B（变更定位/影响面）
+  -> Subagent C（审查结论草稿）
+  -> 主 Agent 终审 + `review_write_result`
+
+适用边界
+- 仓库大、target 范围大、命令耗时长时优先启用 Subagent。
+- 小任务可退化为单 Agent 直连 tools，避免协同开销。
+```
+
+input: 举例说明
+- 任务：`target=current diff`，改动文件 > 20，且包含并发路径。
+
+output：举例说明
+- Subagent A 输出：远程命令执行摘要（成功/失败/超时 + 关键日志片段）。
+- Subagent B 输出：Top N 风险函数、调用链、受影响模块。
+- Subagent C 输出：审查报告草稿 markdown。
+- 主 Agent 输出：最终 `review_result.md` 并回传保存路径。
+
+与agent的交互流程：举例说明
+1. 主 Agent 下发“采集任务”给 Subagent A。
+2. A 返回环境/构建/测试关键信息。
+3. 主 Agent 下发“定位任务”给 Subagent B。
+4. B 返回高风险改动点。
+5. 主 Agent 下发“审查写作任务”给 Subagent C。
+6. C 返回报告初稿；主 Agent 合并定稿并调用 `review_write_result`。
+
+loop设计（如果有）
+- 主 Agent 调度 loop：按“采集 -> 定位 -> 写作 -> 终审”阶段循环，直到信息充分。
+- Subagent A 重试 loop：遇到 timeout 按策略升 timeout 后重跑，达到上限后回传失败并建议人工介入。
