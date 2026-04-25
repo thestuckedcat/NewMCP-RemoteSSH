@@ -381,6 +381,33 @@ def _write_review_files(repo_path: str, target: str, review_tips: str, target_ty
             "4) save review tips and review prompt",
             "5) let agent review and save .review/review_result.md",
         ],
+        "subagent_recommendations": {
+            "orchestrator_pattern": [
+                "orchestrator_agent",
+                "subagent_collection",
+                "subagent_localization",
+                "subagent_review_draft",
+                "orchestrator_finalize_and_write_result",
+            ],
+            "subagents": [
+                {
+                    "name": "subagent_collection",
+                    "responsibility": "run ssh_exec/ssh_exec_script and summarize key stdout/stderr/returncode",
+                },
+                {
+                    "name": "subagent_localization",
+                    "responsibility": "read .review/review_target.md and .review/review_related.md to identify high-risk files/functions",
+                },
+                {
+                    "name": "subagent_review_draft",
+                    "responsibility": "draft review sections from review_prompt.md (summary, must-fix, risks, questions)",
+                },
+            ],
+            "loop_hints": [
+                "collection -> localization -> draft -> finalize",
+                "if timeout occurs, retry with a larger timeout budget before escalating",
+            ],
+        },
     }
 
 

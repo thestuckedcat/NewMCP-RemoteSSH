@@ -12,6 +12,7 @@
 - `ssh_exec(cmd, timeout=30)`：执行短命令。
 - `ssh_exec_script(script, timeout=300)`：执行单次多行脚本（`bash -lc`）。
 - `review_prepare(repo_path, target, review_tips="")`：按 workflow 生成 `.review` 审查上下文文件。
+  - 返回结果包含 `workflow` 与 `subagent_recommendations`，用于指导主 Agent + Subagent 编排。
 - `prepare_review_context(...)`：`review_prepare` 的兼容别名。
 - `review_write_result(repo_path, review_result)`：保存 Agent 最终审查结果到 `.review/review_result.md`。
 
