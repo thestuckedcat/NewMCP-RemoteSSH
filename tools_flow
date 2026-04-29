@@ -89,6 +89,48 @@ loop设计（如果有）
 10. 返回 files 列表与 summary，提示后续让 Agent 审查并写结果。
 ```
 
+实现细节（对应代码执行链路）
+1. 入口与类型识别  
+   - `review_prepare(...)` 内部先调用 `_detect_target_type(target)` 做字符串规则匹配（`current diff`/`staged diff`/`commit xxx`/`patch xxx`/路径/函数名）。  
+   - 然后进入 `_write_review_files(...)` 统一执行后续步骤。
+
+2. 目标源码收集（不是纯 bash 逻辑）  
+   - Python 根据 target_type 动态拼接 shell 脚本（`git diff/git show/cat/sed/rg`），再通过 `_run_stdout -> ssh.run_script` 执行。  
+   - 也就是说：**bash 只负责采集原始文本**，流程控制、类型分支、结果组织都在 Python 里完成。
+
+3. changed_files 与 symbols 提取  
+   - `changed_files`：由 `_extract_changed_files(diff_text)` 在 Python 中解析 `diff --git` / `+++ b/...` 行得到。  
+   - `symbols`：由 `_extract_symbols(text)` 用正则提取函数名、struct、宏、全局变量（并做去重/截断）。
+
+4. `review_target.md` 生成  
+   - `_render_review_target(...)` 负责把目标描述、变更文件、代码片段、符号清单拼成 Markdown。  
+   - 代码块与长度控制由 `_md_code_block` + `_trim_text` 处理，避免上下文过大。
+
+5. `structure.md` 生成  
+   - `_collect_repo_structure(...)` 先采集顶层目录（`find`），再围绕 changed_files 的目录抓取附近文件，最后提取相关构建文件（Makefile/CMakeLists 等）。  
+   - “哪些目录相关”的判断逻辑在 Python 中完成，不是 shell 自动“总结”。
+
+6. `review_related.md` 生成  
+   - `_collect_related_context(...)` 会按函数循环：  
+     - `_collect_function_slice(...)` 抓定义附近片段；  
+     - `_extract_call_like_tokens(...)` 推断可能 callee；  
+     - 再补 caller 引用与 include 信息；  
+   - 最后追加固定风险检查清单（锁、生命周期、错误路径等）。
+
+7. `review_tips.md` / `review_prompt.md`  
+   - `review_tips.md`：直接写入用户 tips（空则 `(none)`）。  
+   - `review_prompt.md`：由 `_review_prompt()` 返回固定模板。
+
+8. 最终落盘与返回  
+   - Python 循环写入 `.review/*.md` 五个文件。  
+   - 返回值里的 `files`、`summary`、`workflow`、`subagent_recommendations` 都是 Python 组装后的结构化结果。
+
+结论：为什么“bash 不能总结这些文件”但工具可以？
+- 你说得对：**单靠 bash 不会自动理解并总结语义**。  
+- 本实现是“**bash 采集 + Python 解析/组织/总结**”的混合模式：  
+  - bash 拿原始数据（diff、目录、片段、引用）；  
+  - Python 做规则判断、字段提取、Markdown 结构化输出。  
+
 input: 举例说明
 - `repo_path`: `"/home/dev/linux"`
 - `target`: `"current diff"`（也可 `"commit abc123"`、`"drivers/net/foo.c"`、`"my_func"`）
